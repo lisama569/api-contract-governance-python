@@ -5,9 +5,15 @@ import logging
 
 from fastapi import FastAPI
 
+from app import contracts
 from app.errors import register_exception_handlers
 from app.idempotency import IdempotencyStore
-from app.routers import create_router, create_unsupported_version_router
+from app.lifecycle import LifecycleRegistry
+from app.routers import (
+    create_admin_router,
+    create_router,
+    create_unsupported_version_router,
+)
 from app.store import DocumentStore
 from app.tracing import TraceFormatter, TraceIdLogFilter, TraceMiddleware
 
@@ -32,6 +38,7 @@ def configure_logging(level: int = logging.INFO) -> None:
 def create_app(
     store: DocumentStore | None = None,
     idempotency: IdempotencyStore | None = None,
+    lifecycle: LifecycleRegistry | None = None,
 ) -> FastAPI:
     configure_logging()
     app = FastAPI(title="api-contract-governance", version="0.1.0")
@@ -39,8 +46,14 @@ def create_app(
     # 单进程内共享的存储；测试可注入（如带延迟的存储）并通过 app.state 断言副作用次数
     store = store if store is not None else DocumentStore()
     idempotency = idempotency if idempotency is not None else IdempotencyStore()
+    lifecycle = (
+        lifecycle
+        if lifecycle is not None
+        else LifecycleRegistry(contracts.SUPPORTED_VERSIONS)
+    )
     app.state.store = store
     app.state.idempotency = idempotency
+    app.state.lifecycle = lifecycle
 
     app.add_middleware(TraceMiddleware)
     register_exception_handlers(app)
@@ -49,9 +62,10 @@ def create_app(
     def healthz() -> dict:
         return {"status": "ok"}
 
-    # 先注册受支持版本的具体路由，再注册未支持版本兜底
-    app.include_router(create_router(1, store, idempotency))
-    app.include_router(create_router(2, store, idempotency))
-    app.include_router(create_unsupported_version_router())
+    # 先注册受支持版本的具体路由，再注册未支持版本兜底与生命周期管理接口
+    app.include_router(create_router(1, store, idempotency, lifecycle))
+    app.include_router(create_router(2, store, idempotency, lifecycle))
+    app.include_router(create_unsupported_version_router(lifecycle))
+    app.include_router(create_admin_router(lifecycle))
 
     return app

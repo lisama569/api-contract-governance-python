@@ -18,6 +18,9 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 TRACE_HEADER = "x-trace-id"
 SCOPE_KEY = "app.trace_id"
+# 生命周期检查在请求处理早期写入的弃用响应头（dict[str, str]），
+# 由中间件统一附加到该请求的任何响应（成功或错误）上
+DEPRECATION_HEADERS_SCOPE_KEY = "app.deprecation_headers"
 
 logger = logging.getLogger("app")
 
@@ -91,6 +94,9 @@ class TraceMiddleware:
                     (k, v) for k, v in raw_headers if k.lower() != TRACE_HEADER.encode()
                 ]
                 raw_headers.append((TRACE_HEADER.encode(), trace_id.encode()))
+                # 版本弃用信息（若本请求命中弃用版本）：成功与错误响应都携带
+                for name, value in scope.get(DEPRECATION_HEADERS_SCOPE_KEY, {}).items():
+                    raw_headers.append((name.encode(), value.encode()))
             await send(message)
 
         query = scope.get("query_string", b"").decode("latin1")
