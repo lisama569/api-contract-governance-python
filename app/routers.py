@@ -9,6 +9,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 from fastapi import APIRouter, Request
@@ -17,6 +19,7 @@ from starlette.responses import JSONResponse
 from app import contracts
 from app.errors import AppError, ErrorCode
 from app.idempotency import IdempotencyStore, ReplayOutcome
+from app.lifecycle import VersionRegistry, VersionState
 from app.store import DocumentStore
 
 logger = logging.getLogger("app")
@@ -207,34 +210,143 @@ def create_router(
     return router
 
 
-def create_unsupported_version_router() -> APIRouter:
-    """/api 下未受支持版本的兜底：明确拒绝并给出可区分原因（而非 404）。"""
+def create_unsupported_version_router(registry: VersionRegistry) -> APIRouter:
+    """/api 下未被具体路由命中的兜底：按真实原因给出可区分结论。
+
+    判定顺序（先版本、后路径、再方法）：
+    - 版本段非数字            -> VALIDATION_ERROR
+    - 版本已知但已下线        -> VERSION_SUNSET（410）
+    - 版本从未被支持          -> VERSION_NOT_SUPPORTED（400）
+    - 版本在服务但路径不存在  -> NOT_FOUND（404）
+    - 路径存在但方法不支持    -> METHOD_NOT_ALLOWED（405）
+    """
     router = APIRouter()
+
+    # 各版本已知端点的路径形状与允许方法（用于区分 404 与 405）
+    known_endpoints: list[tuple[re.Pattern[str], frozenset[str]]] = [
+        (re.compile(r"^/api/v\d+/documents$"), frozenset({"POST"})),
+        (re.compile(r"^/api/v\d+/documents/[^/]+$"), frozenset({"GET", "PUT"})),
+    ]
 
     @router.api_route(
         "/api/v{raw_version}/{rest:path}",
         methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     )
-    async def unsupported_version(raw_version: str, rest: str) -> JSONResponse:
-        return _reject(raw_version)
+    async def unsupported_version(raw_version: str, rest: str, request: Request) -> JSONResponse:
+        return await _reject(raw_version, request)
 
     @router.api_route(
         "/api/v{raw_version}",
         methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     )
-    async def unsupported_version_collection(raw_version: str) -> JSONResponse:
-        return _reject(raw_version)
+    async def unsupported_version_collection(raw_version: str, request: Request) -> JSONResponse:
+        return await _reject(raw_version, request)
 
-    def _reject(raw_version: str) -> JSONResponse:
+    async def _reject(raw_version: str, request: Request) -> JSONResponse:
         version = contracts.parse_version(raw_version)
+        snapshot = await registry.snapshot(version)
+        if snapshot is None:
+            raise AppError(
+                ErrorCode.VERSION_NOT_SUPPORTED,
+                f"不支持的 API 版本 v{version}，请使用 v{min(contracts.SUPPORTED_VERSIONS)} - v{max(contracts.SUPPORTED_VERSIONS)}",
+                details={
+                    "requested_version": version,
+                    "supported_versions": list(contracts.SUPPORTED_VERSIONS),
+                    "latest_version": contracts.LATEST_VERSION,
+                },
+            )
+        # 防御：下线版本正常会被中间件拦截；若走到这里仍给出一致结论
+        if snapshot.effective_state(datetime.now(timezone.utc)) is VersionState.SUNSET:
+            raise AppError(
+                ErrorCode.VERSION_SUNSET,
+                f"API 版本 v{version} 已下线",
+                details={
+                    "requested_version": version,
+                    "successor": snapshot.successor,
+                    "sunset_at": snapshot.sunset_at,
+                },
+            )
+        # 版本已知：正常请求不会走到这里（中间件已拦截下线版本、具体路由已命中），
+        # 走到这里说明路径或方法不对，按形状区分 404 / 405。
+        path = request.url.path
+        for pattern, allowed in known_endpoints:
+            if pattern.match(path):
+                raise AppError(
+                    ErrorCode.METHOD_NOT_ALLOWED,
+                    f"v{version} 的该路径不支持 {request.method} 方法",
+                    details={
+                        "version": version,
+                        "method": request.method,
+                        "path": path,
+                        "allowed_methods": sorted(allowed),
+                    },
+                )
         raise AppError(
-            ErrorCode.VERSION_NOT_SUPPORTED,
-            f"不支持的 API 版本 v{version}，请使用 v{min(contracts.SUPPORTED_VERSIONS)} - v{max(contracts.SUPPORTED_VERSIONS)}",
-            details={
-                "requested_version": version,
-                "supported_versions": list(contracts.SUPPORTED_VERSIONS),
-                "latest_version": contracts.LATEST_VERSION,
+            ErrorCode.NOT_FOUND,
+            "请求的路径不存在",
+            details={"version": version, "method": request.method, "path": path},
+        )
+
+    return router
+
+
+def create_lifecycle_router(registry: VersionRegistry) -> APIRouter:
+    """版本生命周期的查询与运行期调整端点（演示环境未鉴权）。"""
+    router = APIRouter(tags=["lifecycle"])
+
+    @router.get("/api/versions")
+    async def list_versions() -> JSONResponse:
+        snapshots = await registry.all_snapshots()
+        now = datetime.now(timezone.utc)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "versions": [s.to_dict(now) for s in snapshots],
+                "latest_version": registry.latest,
             },
+        )
+
+    @router.put("/api/versions/{version}/lifecycle")
+    async def adjust_lifecycle(version: int, request: Request) -> JSONResponse:
+        payload, _ = await _json_body(request)
+        raw_state = payload.get("state")
+        if raw_state not in {s.value for s in VersionState}:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "state 必须是 active / deprecated / sunset 之一",
+                details={"received_state": raw_state},
+            )
+        logger.info(
+            "event=lifecycle_adjust_request version=%s input=%s", version, payload
+        )
+        if raw_state == VersionState.ACTIVE.value:
+            updated = await registry.activate(version)
+        elif raw_state == VersionState.SUNSET.value:
+            updated = await registry.retire(version)
+        else:
+            sunset_at = payload.get("sunset_at")
+            successor = payload.get("successor")
+            current = await registry.snapshot(version)
+            if successor is None and current is not None and current.state is VersionState.DEPRECATED:
+                # 仅调整下线时间（提前或延后）
+                if not isinstance(sunset_at, str):
+                    raise AppError(
+                        ErrorCode.VALIDATION_ERROR,
+                        "调整下线时间必须携带 sunset_at（ISO 8601）",
+                        details={"required_field": "sunset_at"},
+                    )
+                updated = await registry.set_sunset(version, sunset_at)
+            else:
+                if not isinstance(successor, int) or not isinstance(sunset_at, str):
+                    raise AppError(
+                        ErrorCode.VALIDATION_ERROR,
+                        "标记弃用必须携带 successor（整数版本号）与 sunset_at（ISO 8601）",
+                        details={"required_fields": ["successor", "sunset_at"]},
+                    )
+                updated = await registry.deprecate(version, successor, sunset_at)
+        return JSONResponse(
+            status_code=200,
+            content=updated.to_dict(datetime.now(timezone.utc)),
         )
 
     return router

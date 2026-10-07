@@ -3,8 +3,9 @@
 为一个 HTTP 资源服务提供三类可演进、可解释的治理能力：
 
 1. **可版本化的接口契约**：同一资源可在多个 API 版本下被访问，新增/删除/改名字段不会让旧版本调用方拿到错位或被污染的数据；不支持的版本被明确拒绝。
-2. **写操作幂等与并发控制**：相同幂等标识的重复或并发请求只产生一次真实副作用并回放一致结果；并发修改通过乐观锁识别，基于陈旧状态的更新被明确拒绝。
-3. **归一化错误契约与追踪**：所有失败返回稳定可区分的结构，不泄漏内部堆栈；每个请求有贯穿响应头、错误体与日志的 `trace_id`。
+2. **版本生命周期治理**：版本可标记弃用（行为不变、响应头提示迁移目标与下线时间）、到期或手动下线（明确拒绝）；状态可在运行期调整，且每个版本当前状态可查询。
+3. **写操作幂等与并发控制**：相同幂等标识的重复或并发请求只产生一次真实副作用并回放一致结果；并发修改通过乐观锁识别，基于陈旧状态的更新被明确拒绝。
+4. **归一化错误契约与追踪**：所有失败返回稳定可区分的结构，不泄漏内部堆栈；每个请求有贯穿响应头、错误体与日志的 `trace_id`。
 
 本服务为**单进程内存实现**，不依赖数据库或外部服务，便于在本地直接运行与验证；真实部署时把 `DocumentStore` / `IdempotencyStore` 换成带持久化与跨进程协调的实现即可，契约语义不变。
 
@@ -35,6 +36,7 @@ uv run pytest
 | --- | --- |
 | `tests/test_idempotency.py` | 顺序重复回放、**8 路真并发重复提交只一次副作用**、同键不同体冲突、并发重复更新 |
 | `tests/test_versioning.py` | v1 不泄漏 v2 字段、改名字段在旧版本被拒、新增字段不改变旧语义、不支持/非法版本 |
+| `tests/test_lifecycle.py` | 弃用期旧语义不变且带弃用响应头、下线后 410 拒绝、五类边界结论互不相同且带追踪标识、下线时间提前/延后、**并发流量下运行期下线结论自洽且副作用不丢不重** |
 | `tests/test_concurrency.py` | 陈旧更新被拒、缺少版本前提、v1 旧字段名乐观锁、**6 路并发更新 1 成功 5 冲突** |
 | `tests/test_errors.py` | 错误信封稳定性、错误分类、trace_id 头/体一致、客户端透传、非法 JSON、无堆栈泄漏 |
 | `tests/test_internal_error.py` | 未预期异常归一化为 500，堆栈只进日志且 trace_id 一致 |
@@ -52,6 +54,8 @@ uv run pytest
 | `POST /api/v{version}/documents` | 创建文档，请求体需含 `id`；支持 `Idempotency-Key` |
 | `GET  /api/v{version}/documents/{id}` | 读取文档（按版本序列化） |
 | `PUT  /api/v{version}/documents/{id}` | 整体替换，必须携带版本字段（v1 `rev` / v2 `revision`）；支持 `Idempotency-Key` |
+| `GET  /api/versions` | 查询各版本生命周期状态、迁移目标与下线时间 |
+| `PUT  /api/versions/{version}/lifecycle` | 运行期调整版本状态（弃用 / 调整下线时间 / 下线 / 恢复） |
 | `GET  /healthz` | 健康检查 |
 
 ### 快速示例
@@ -98,6 +102,75 @@ curl -s -X PUT http://127.0.0.1:8000/api/v2/documents/doc-1 \
 - **不支持的版本被明确拒绝**：
   - `/api/v3/...` → `400 VERSION_NOT_SUPPORTED`，`details` 含 `requested_version / supported_versions / latest_version`；它与 `404 NOT_FOUND`（资源不存在）可区分。
   - `/api/vx/...`（版本段非数字）→ `400 VALIDATION_ERROR`。
+
+---
+
+## 3.1 版本生命周期
+
+每个版本处于三种状态之一，状态保存在运行期可调整的 `VersionRegistry` 中：
+
+| 状态 | 含义 | 兼容范围 |
+| --- | --- | --- |
+| `active` | 正常服务 | 完整契约，无任何弃用信号 |
+| `deprecated` | 仍在服务，进入迁移期 | **读写行为与字段语义和弃用前完全一致**（不少字段、不改名、不改结果）；响应额外携带弃用头，提示迁移目标与计划下线时间 |
+| `sunset` | 已下线 | 该版本下所有请求以 `410 VERSION_SUNSET` 拒绝；已产生的数据不受影响，可在其它受支持版本下继续访问 |
+
+### 弃用期信号（只加响应头，不动响应体）
+
+弃用版本的每个响应携带：
+
+```
+Deprecation: @1791358220                                  # RFC 9745，弃用时间点
+Sunset: Thu, 01 Jan 2099 00:00:00 GMT                     # RFC 8594，计划下线时间
+Link: </api/v2/documents>; rel="successor-version"        # 建议迁移目标
+```
+
+`sunset_at` 到期后版本自动按 `sunset` 处理，无需人工介入。
+
+### 边界结论怎么区分
+
+| 情形 | HTTP | `error.code` |
+| --- | --- | --- |
+| 版本已下线 | 410 | `VERSION_SUNSET`（`details` 带 `successor` / `sunset_at`） |
+| 版本从未被支持 | 400 | `VERSION_NOT_SUPPORTED`（`details` 带支持范围） |
+| 版本号写法非法（如 `vx`） | 400 | `VALIDATION_ERROR` |
+| 版本在服务但路径不存在 | 404 | `NOT_FOUND` |
+| 路径存在但该版本不支持此方法 | 405 | `METHOD_NOT_ALLOWED`（`details` 带 `allowed_methods`） |
+
+五类结论都落在同一套错误信封里、都带 `trace_id`，且两两可区分；判定按「版本 → 路径 → 方法」的顺序进行，结论与实际原因一一对应。
+
+### 运行期管理与查询
+
+```bash
+# 查询每个版本当前状态与下线时间
+curl -s http://127.0.0.1:8000/api/versions
+
+# 标记 v1 弃用：迁移目标 v2，计划 2027-01-01 下线
+curl -s -X PUT http://127.0.0.1:8000/api/versions/1/lifecycle \
+  -H 'Content-Type: application/json' \
+  -d '{"state":"deprecated","successor":2,"sunset_at":"2027-01-01T00:00:00Z"}'
+
+# 调整下线时间（提前或延后，仅弃用中的版本）
+curl -s -X PUT http://127.0.0.1:8000/api/versions/1/lifecycle \
+  -H 'Content-Type: application/json' \
+  -d '{"state":"deprecated","sunset_at":"2026-12-01T00:00:00Z"}'
+
+# 立即下线 / 恢复服务
+curl -s -X PUT http://127.0.0.1:8000/api/versions/1/lifecycle \
+  -H 'Content-Type: application/json' -d '{"state":"sunset"}'
+curl -s -X PUT http://127.0.0.1:8000/api/versions/1/lifecycle \
+  -H 'Content-Type: application/json' -d '{"state":"active"}'
+```
+
+> 演示环境的调整端点未鉴权；生产部署应将其接入管理通道（鉴权 + 审计），写入的仍是同一个 `VersionRegistry`。
+
+**一致性保证**：每个请求进入时取一次原子生命周期快照，整个请求只依据该快照判定——运行期调整（如把下线时间提前）不会让进行中的请求看到自相矛盾的结论；调整只影响后续请求，已成功产生的副作用（文档写入、幂等记录）不会被重复计算或丢失。
+
+### 迁移建议
+
+1. 监控响应头：发现 `Deprecation` 头即应规划迁移，`Link` 头给出目标版本，`Sunset` 头给出最后期限；
+2. 按目标版本的字段契约改造请求/响应处理（见第 3 节字段契约表）；
+3. 在下线前完成切换；若收到 `VERSION_SUNSET`，按 `details.successor` 指向的版本重试。
 
 ---
 
@@ -148,7 +221,9 @@ curl -s -X PUT http://127.0.0.1:8000/api/v2/documents/doc-1 \
 | --- | --- | --- | --- |
 | `VALIDATION_ERROR` | 400 | 参数/格式/契约校验失败 | 缺字段、类型错、非法 JSON、旧版本出现未知字段、版本段非数字 |
 | `VERSION_NOT_SUPPORTED` | 400 | 请求了未支持的 API 版本 | `/api/v3/...` |
-| `NOT_FOUND` | 404 | 资源不存在 | 读取/更新未知 id |
+| `VERSION_SUNSET` | 410 | 版本已下线 | 访问处于 `sunset` 状态的版本 |
+| `NOT_FOUND` | 404 | 资源或路径不存在 | 读取/更新未知 id；版本在服务但路径不存在 |
+| `METHOD_NOT_ALLOWED` | 405 | 该版本不支持此请求方法 | 对文档端点发 `DELETE` 等 |
 | `PRECONDITION_REQUIRED` | 428 | 更新缺少并发前提字段 | PUT 未带 `rev`/`revision` |
 | `STALE_WRITE` | 409 | 基于陈旧版本的更新被拒 | `expected_revision ≠ actual_revision` |
 | `STATE_CONFLICT` | 409 | 资源状态冲突 | 无幂等键重复创建；幂等首请求长时间未完成 |
@@ -177,7 +252,8 @@ app/
   idempotency.py   # 基于 asyncio 的幂等状态机（EXECUTE/REPLAY/IN_FLIGHT/CONFLICT）
   store.py         # 内存资源存储 + revision 乐观锁 + 真实副作用计数
   contracts.py     # 版本协商、各版本字段编解码（改名映射/未知字段拒绝）
-  routers.py       # v1/v2 路由工厂、幂等写入包装、不支持版本兜底
+  lifecycle.py     # 版本生命周期状态机、运行期注册表、弃用/下线中间件
+  routers.py       # v1/v2 路由工厂、生命周期查询与调整端点、版本兜底
   app.py           # 应用装配（中间件、处理器、共享存储、路由）
 main.py            # create_app() 暴露 ASGI app
 tests/             # 并发/版本/错误/内部异常测试 + 实时日志

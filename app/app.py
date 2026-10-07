@@ -5,9 +5,15 @@ import logging
 
 from fastapi import FastAPI
 
+from app import contracts
 from app.errors import register_exception_handlers
 from app.idempotency import IdempotencyStore
-from app.routers import create_router, create_unsupported_version_router
+from app.lifecycle import VersionLifecycleMiddleware, VersionRegistry
+from app.routers import (
+    create_lifecycle_router,
+    create_router,
+    create_unsupported_version_router,
+)
 from app.store import DocumentStore
 from app.tracing import TraceFormatter, TraceIdLogFilter, TraceMiddleware
 
@@ -32,6 +38,7 @@ def configure_logging(level: int = logging.INFO) -> None:
 def create_app(
     store: DocumentStore | None = None,
     idempotency: IdempotencyStore | None = None,
+    versions: VersionRegistry | None = None,
 ) -> FastAPI:
     configure_logging()
     app = FastAPI(title="api-contract-governance", version="0.1.0")
@@ -39,9 +46,17 @@ def create_app(
     # 单进程内共享的存储；测试可注入（如带延迟的存储）并通过 app.state 断言副作用次数
     store = store if store is not None else DocumentStore()
     idempotency = idempotency if idempotency is not None else IdempotencyStore()
+    versions = (
+        versions
+        if versions is not None
+        else VersionRegistry(contracts.SUPPORTED_VERSIONS, contracts.LATEST_VERSION)
+    )
     app.state.store = store
     app.state.idempotency = idempotency
+    app.state.versions = versions
 
+    # 后添加的中间件在最外层：Trace 最外（先生成 trace_id），生命周期判定在其内
+    app.add_middleware(VersionLifecycleMiddleware, registry=versions)
     app.add_middleware(TraceMiddleware)
     register_exception_handlers(app)
 
@@ -49,9 +64,10 @@ def create_app(
     def healthz() -> dict:
         return {"status": "ok"}
 
-    # 先注册受支持版本的具体路由，再注册未支持版本兜底
+    # 先注册生命周期查询/调整与受支持版本的具体路由，再注册版本兜底
+    app.include_router(create_lifecycle_router(versions))
     app.include_router(create_router(1, store, idempotency))
     app.include_router(create_router(2, store, idempotency))
-    app.include_router(create_unsupported_version_router())
+    app.include_router(create_unsupported_version_router(versions))
 
     return app
